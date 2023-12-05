@@ -37,18 +37,6 @@
 static const efi_guid_t partition_basic_data_guid = PARTITION_BASIC_DATA_GUID;
 #endif
 
-/**
- * efi_crc32() - EFI version of crc32 function
- * @buf: buffer to calculate crc32 of
- * @len - length of buf
- *
- * Description: Returns EFI-style CRC32 value for @buf
- */
-static inline u32 efi_crc32(const void *buf, u32 len)
-{
-	return crc32(0, buf, len);
-}
-
 /*
  * Private function prototypes
  */
@@ -59,7 +47,6 @@ static int is_gpt_valid(struct blk_desc *desc, u64 lba, gpt_header *pgpt_head,
 			gpt_entry **pgpt_pte);
 static gpt_entry *alloc_read_gpt_entries(struct blk_desc *desc,
 					 gpt_header *pgpt_head);
-static int is_pte_valid(gpt_entry * pte);
 static int find_valid_gpt(struct blk_desc *desc, gpt_header *gpt_head,
 			  gpt_entry **pgpt_pte);
 
@@ -90,8 +77,8 @@ static int get_bootable(gpt_entry *p)
 	return ret;
 }
 
-static int validate_gpt_header(gpt_header *gpt_h, lbaint_t lba,
-		lbaint_t lastlba)
+int validate_gpt_header(gpt_header *gpt_h, lbaint_t lba,
+			lbaint_t lastlba)
 {
 	uint32_t crc32_backup = 0;
 	uint32_t calc_crc32;
@@ -237,7 +224,7 @@ void part_print_efi(struct blk_desc *desc)
 
 	for (i = 0; i < le32_to_cpu(gpt_head->num_partition_entries); i++) {
 		/* Skip invalid PTE */
-		if (!is_pte_valid(&gpt_pte[i]))
+		if (!gpt_is_pte_valid(&gpt_pte[i]))
 			continue;
 
 		printf("%3d\t0x%08llx\t0x%08llx\t\"%s\"\n", (i + 1),
@@ -276,7 +263,7 @@ int part_get_info_efi(struct blk_desc *desc, int part,
 		return -EINVAL;
 
 	if (part > le32_to_cpu(gpt_head->num_partition_entries) ||
-	    !is_pte_valid(&gpt_pte[part - 1])) {
+	    !gpt_is_pte_valid(&gpt_pte[part - 1])) {
 		log_debug("Invalid partition number %d\n", part);
 		free(gpt_pte);
 		return -EPERM;
@@ -1159,12 +1146,12 @@ static gpt_entry *alloc_read_gpt_entries(struct blk_desc *desc,
 }
 
 /**
- * is_pte_valid(): validates a single Partition Table Entry
+ * gpt_is_pte_valid(): validates a single Partition Table Entry
  * @gpt_entry - Pointer to a single Partition Table Entry
  *
  * Description: returns 1 if valid,  0 on error.
  */
-static int is_pte_valid(gpt_entry * pte)
+int gpt_is_pte_valid(gpt_entry * pte)
 {
 	efi_guid_t unused_guid;
 

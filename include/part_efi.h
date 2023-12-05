@@ -13,6 +13,9 @@
 */
 
 #include <linux/compiler.h>
+#include <compiler.h>
+#include <u-boot/crc.h>
+#include <blk.h>
 
 #ifndef _DISK_PART_EFI_H
 #define _DISK_PART_EFI_H
@@ -137,5 +140,22 @@ typedef struct _legacy_mbr {
 	struct partition partition_record[4];
 	__le16 signature;
 } __packed legacy_mbr;
+
+/* Helpers for validating GPT metadata */
+
+/**
+ * efi_crc32() - EFI version of crc32 function
+ * @buf: buffer to calculate crc32 of
+ * @len - length of buf
+ *
+ * Description: Returns EFI-style CRC32 value for @buf
+ */
+static inline u32 efi_crc32(const void *buf, u32 len)
+{
+        return crc32(0, buf, len);
+}
+
+int validate_gpt_header(gpt_header *gpt_h, lbaint_t lba, lbaint_t lastlba);
+int gpt_is_pte_valid(gpt_entry * pte);
 
 #endif	/* _DISK_PART_EFI_H */
