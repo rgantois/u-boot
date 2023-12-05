@@ -1,6 +1,7 @@
 menu "MTD Support"
 
 config MTD_PARTITIONS
+	select EFI_PARTITION
 	bool
 
 config MTD

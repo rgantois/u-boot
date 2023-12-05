@@ -24,12 +24,16 @@
 #include <linux/bug.h>
 #include <linux/errno.h>
 #include <linux/compat.h>
-#include <ubi_uboot.h>
 
 #include <linux/mtd/mtd.h>
 #include <linux/mtd/partitions.h>
 #include <linux/err.h>
 #include <linux/sizes.h>
+#include <linux/math64.h>
+#include <linux/ctype.h>
+#include <part_efi.h>
+#include <memalign.h>
+#include <blk.h>
 
 #include "mtdcore.h"
 
@@ -65,6 +69,24 @@ char *kstrdup(const char *s, gfp_t gfp)
 
 #define MTD_SIZE_REMAINING		(~0LLU)
 #define MTD_OFFSET_NOT_SPECIFIED	(~0LLU)
+
+/* Definitions for GPT parsing */
+
+#define MTD_GPT_LBA_SIZE 512
+
+/* As per UEFI standard */
+#define MTD_GPT_PARTNAME_SIZE sizeof(((gpt_entry *)0)->partition_name)
+
+#define mtd_gpt_lba_to_offset(x) ((x) * MTD_GPT_LBA_SIZE)
+#define mtd_gpt_lba_to_size(x)   ((size_t)(x) * MTD_GPT_LBA_SIZE)
+
+/*
+ * This value is pretty much arbitrary, it's in the range of typical MTD parser
+ * caps. Creating too many partitions on a raw Flash device is a bad idea
+ * anyway.
+ */
+#define MTD_GPT_MAX_PARTS 32
+
 
 bool mtd_partitions_used(struct mtd_info *master)
 {
@@ -290,7 +312,7 @@ void mtd_free_parsed_partitions(struct mtd_partition *parts,
  */
 
 static int part_read(struct mtd_info *mtd, loff_t from, size_t len,
-		size_t *retlen, u_char *buf)
+		     size_t *retlen, u_char *buf)
 {
 	struct mtd_ecc_stats stats;
 	int res;
@@ -309,7 +331,7 @@ static int part_read(struct mtd_info *mtd, loff_t from, size_t len,
 
 #ifndef __UBOOT__
 static int part_point(struct mtd_info *mtd, loff_t from, size_t len,
-		size_t *retlen, void **virt, resource_size_t *phys)
+		      size_t *retlen, void **virt, resource_size_t *phys)
 {
 	return mtd->parent->_point(mtd->parent, from + mtd->offset, len,
 				   retlen, virt, phys);
@@ -331,7 +353,7 @@ static unsigned long part_get_unmapped_area(struct mtd_info *mtd,
 }
 
 static int part_read_oob(struct mtd_info *mtd, loff_t from,
-		struct mtd_oob_ops *ops)
+			 struct mtd_oob_ops *ops)
 {
 	int res;
 
@@ -368,7 +390,7 @@ static int part_read_oob(struct mtd_info *mtd, loff_t from,
 }
 
 static int part_read_user_prot_reg(struct mtd_info *mtd, loff_t from,
-		size_t len, size_t *retlen, u_char *buf)
+				   size_t len, size_t *retlen, u_char *buf)
 {
 	return mtd->parent->_read_user_prot_reg(mtd->parent, from, len,
 						retlen, buf);
@@ -382,7 +404,7 @@ static int part_get_user_prot_info(struct mtd_info *mtd, size_t len,
 }
 
 static int part_read_fact_prot_reg(struct mtd_info *mtd, loff_t from,
-		size_t len, size_t *retlen, u_char *buf)
+				   size_t len, size_t *retlen, u_char *buf)
 {
 	return mtd->parent->_read_fact_prot_reg(mtd->parent, from, len,
 						retlen, buf);
@@ -396,21 +418,21 @@ static int part_get_fact_prot_info(struct mtd_info *mtd, size_t len,
 }
 
 static int part_write(struct mtd_info *mtd, loff_t to, size_t len,
-		size_t *retlen, const u_char *buf)
+		      size_t *retlen, const u_char *buf)
 {
 	return mtd->parent->_write(mtd->parent, to + mtd->offset, len,
 				   retlen, buf);
 }
 
 static int part_panic_write(struct mtd_info *mtd, loff_t to, size_t len,
-		size_t *retlen, const u_char *buf)
+			    size_t *retlen, const u_char *buf)
 {
 	return mtd->parent->_panic_write(mtd->parent, to + mtd->offset, len,
 					 retlen, buf);
 }
 
 static int part_write_oob(struct mtd_info *mtd, loff_t to,
-		struct mtd_oob_ops *ops)
+			  struct mtd_oob_ops *ops)
 {
 	if (to >= mtd->size)
 		return -EINVAL;
@@ -420,21 +442,21 @@ static int part_write_oob(struct mtd_info *mtd, loff_t to,
 }
 
 static int part_write_user_prot_reg(struct mtd_info *mtd, loff_t from,
-		size_t len, size_t *retlen, u_char *buf)
+				    size_t len, size_t *retlen, u_char *buf)
 {
 	return mtd->parent->_write_user_prot_reg(mtd->parent, from, len,
 						 retlen, buf);
 }
 
 static int part_lock_user_prot_reg(struct mtd_info *mtd, loff_t from,
-		size_t len)
+				   size_t len)
 {
 	return mtd->parent->_lock_user_prot_reg(mtd->parent, from, len);
 }
 
 #ifndef __UBOOT__
 static int part_writev(struct mtd_info *mtd, const struct kvec *vecs,
-		unsigned long count, loff_t to, size_t *retlen)
+		       unsigned long count, loff_t to, size_t *retlen)
 {
 	return mtd->parent->_writev(mtd->parent, vecs, count,
 				    to + mtd->offset, retlen);
@@ -668,19 +690,19 @@ static struct mtd_info *allocate_partition(struct mtd_info *master,
 			/* Round up to next erasesize */
 			slave->offset = (mtd_div_by_eb(cur_offset, master) + 1) * master->erasesize;
 			debug("Moving partition %d: "
-			       "0x%012llx -> 0x%012llx\n", partno,
-			       (unsigned long long)cur_offset, (unsigned long long)slave->offset);
+			      "0x%012llx -> 0x%012llx\n", partno,
+			      (unsigned long long)cur_offset, (unsigned long long)slave->offset);
 		}
 	}
 	if (slave->offset == MTDPART_OFS_RETAIN) {
 		slave->offset = cur_offset;
 		if (master->size - slave->offset >= slave->size) {
 			slave->size = master->size - slave->offset
-							- slave->size;
+				- slave->size;
 		} else {
 			debug("mtd partition \"%s\" doesn't have enough space: %#llx < %#llx, disabled\n",
-				part->name, master->size - slave->offset,
-				slave->size);
+			      part->name, master->size - slave->offset,
+			      slave->size);
 			/* register to preserve ordering */
 			goto out_register;
 		}
@@ -689,7 +711,7 @@ static struct mtd_info *allocate_partition(struct mtd_info *master,
 		slave->size = master->size - slave->offset;
 
 	debug("0x%012llx-0x%012llx : \"%s\"\n", (unsigned long long)slave->offset,
-		(unsigned long long)(slave->offset + slave->size), slave->name);
+	      (unsigned long long)(slave->offset + slave->size), slave->name);
 
 	/* let's do some sanity checks */
 	if (slave->offset >= master->size) {
@@ -697,7 +719,7 @@ static struct mtd_info *allocate_partition(struct mtd_info *master,
 		slave->offset = 0;
 		slave->size = 0;
 		printk(KERN_ERR"mtd: partition \"%s\" is out of reach -- disabled\n",
-			part->name);
+		       part->name);
 		goto out_register;
 	}
 	if (slave->offset + slave->size > master->size) {
@@ -737,13 +759,13 @@ static struct mtd_info *allocate_partition(struct mtd_info *master,
 		 * _minor_ erase size though */
 		slave->flags &= ~MTD_WRITEABLE;
 		printk(KERN_WARNING"mtd: partition \"%s\" doesn't start on an erase block boundary -- force read-only\n",
-			part->name);
+		       part->name);
 	}
 	if ((slave->flags & MTD_WRITEABLE) &&
 	    mtd_mod_by_eb(slave->size, slave)) {
 		slave->flags &= ~MTD_WRITEABLE;
 		printk(KERN_WARNING"mtd: partition \"%s\" doesn't end on an erase block -- force read-only\n",
-			part->name);
+		       part->name);
 	}
 
 	slave->ecclayout = master->ecclayout;
@@ -853,7 +875,6 @@ EXPORT_SYMBOL_GPL(mtd_del_partition);
  * We don't register the master, or expect the caller to have done so,
  * for reasons of data integrity.
  */
-
 int add_mtd_partitions(struct mtd_info *master,
 		       const struct mtd_partition *parts,
 		       int nbparts)
@@ -881,23 +902,178 @@ int add_mtd_partitions(struct mtd_info *master,
 	return 0;
 }
 
-#if CONFIG_IS_ENABLED(DM) && CONFIG_IS_ENABLED(OF_CONTROL)
-int add_mtd_partitions_of(struct mtd_info *master)
+static int mtd_gpt_read_header(struct mtd_info *mtd, gpt_header *gpt, int lba, u64 last_lba)
 {
-	ofnode parts, child;
+	loff_t read_offset = mtd_gpt_lba_to_offset(lba);
+	size_t retlen;
+	int ret;
+
+	debug("reading GPT header at offset %lli\n", read_offset);
+
+	ret = mtd_read(mtd, read_offset, MTD_GPT_LBA_SIZE, &retlen, (u_char *)gpt);
+	if (ret) {
+		printf("Failed to read GPT header from MTD device!\n");
+		return -EIO;
+	}
+
+	if (retlen < MTD_GPT_LBA_SIZE) {
+		printf("truncated read 0x%zx from MTD device! expected 0x%x\n",
+		       retlen, MTD_GPT_LBA_SIZE);
+		return -EIO;
+	}
+
+	return validate_gpt_header(gpt, lba, last_lba);
+}
+
+/**
+ * utf16_le_to_7bit(): Naively converts a UTF-16LE string to 7-bit ASCII characters
+ * @in: input UTF-16LE string
+ * @size: size of the input string
+ * @out: output string ptr, should be capable to store @size+1 characters
+ *
+ * Description: Converts @size UTF16-LE symbols from @in string to 7-bit
+ * ASCII characters and stores them to @out. Adds trailing zero to @out array.
+ */
+static void utf16_le_to_7bit(const __le16 *in, unsigned int size, u8 *out)
+{
+	unsigned int i = 0;
+
+	out[size] = 0;
+
+	while (i < size) {
+		u8 c = le16_to_cpu(in[i]) & 0xff;
+
+		if (c && !isprint(c))
+			c = '!';
+		out[i] = c;
+		i++;
+	}
+}
+
+// Returns size in bytes of PTE array
+static inline int get_pt_size(gpt_header *gpt)
+{
+	return le32_to_cpu(gpt->num_partition_entries)
+		* le32_to_cpu(gpt->sizeof_partition_entry);
+}
+
+/* Check the GUID Partition Entry Array CRC */
+int gpt_check_pte_array_crc(gpt_header *gpt, gpt_entry *ptes)
+{
+        u32 crc;
+
+        crc = efi_crc32((const unsigned char *)ptes, get_pt_size(gpt));
+        if (crc != le32_to_cpu(gpt->partition_entry_array_crc32)) {
+                pr_debug("GUID Partition Entry Array CRC check failed.\n");
+                return -EINVAL;
+        }
+
+        return 0;
+}
+
+static int add_mtd_partitions_gpt(struct mtd_info *mtd)
+{
+	ALLOC_CACHE_ALIGN_BUFFER_PAD(gpt_header, gpt, 1, MTD_GPT_LBA_SIZE);
+	u64 last_lba = div_u64(mtd->size, MTD_GPT_LBA_SIZE) - 1ULL;
+	char part_name[MTD_GPT_PARTNAME_SIZE + 1];
+	int ret = 0, part_no, valid_parts = 0;
+	size_t pte_read_size, retlen;
+	gpt_entry *ptes, *pte;
+	loff_t pte_read_offset;
+	struct mtd_info *slave;
+	unsigned int nr_parts;
+
+	if (mtd_type_is_nand(mtd)) {
+		/* NAND flash devices are too susceptible to bad blocks */
+		printf("GPT parsing is forbidden on NAND devices!");
+		return -EPERM;
+	}
+
+	ret = mtd_gpt_read_header(mtd, gpt, GPT_PRIMARY_PARTITION_TABLE_LBA, last_lba);
+	if (ret) {
+		printf("Primary GPT is invalid! Trying alternate GPT\n");
+
+		ret = mtd_gpt_read_header(mtd, gpt, gpt->alternate_lba, last_lba);
+		if (ret) {
+			printf("Alternate GPT is also invalid!\n");
+			return ret;
+		}
+	}
+
+	/* This should contain the PTE array */
+	pte_read_offset = mtd_gpt_lba_to_offset(le64_to_cpu(gpt->partition_entry_lba));
+	pte_read_size = get_pt_size(gpt);
+
+	ptes = memalign(ARCH_DMA_MINALIGN, PAD_SIZE(pte_read_size, MTD_GPT_LBA_SIZE));
+	if (!ptes)
+		return -ENOMEM;
+
+	debug("Reading GPT PTE array from MTD device\n");
+	ret = mtd_read(mtd, pte_read_offset, pte_read_size, &retlen, (u_char *)ptes);
+	if (ret)
+		goto free_ptes;
+
+	/* Check CRC */
+	ret = gpt_check_pte_array_crc(gpt, ptes);
+	if (ret) {
+		printf("GPT PTE array CRC check failed!\n");
+		goto free_ptes;
+	}
+
+	nr_parts = le32_to_cpu(gpt->num_partition_entries);
+	for (part_no = 0; part_no < nr_parts && valid_parts < MTD_GPT_MAX_PARTS; part_no++) {
+		struct mtd_partition part = { 0 };
+		pte = &ptes[part_no];
+
+		if (!gpt_is_pte_valid(pte)) {
+			debug("Skipping invalid partition entry %d!\n", part_no);
+			continue;
+		}
+
+		part.offset = mtd_gpt_lba_to_offset(le64_to_cpu(pte->starting_lba));
+		part.size = mtd_gpt_lba_to_size(le64_to_cpu(pte->ending_lba) -
+						le64_to_cpu(pte->starting_lba) + 1ULL);
+		part.name = part_name;
+
+		/* part->name is const so we can't pass it directly */
+		utf16_le_to_7bit(pte->partition_name,
+				 MTD_GPT_PARTNAME_SIZE / sizeof(__le16),
+				 part_name);
+
+		slave = allocate_partition(mtd, &part, 0, 0);
+		if (IS_ERR(slave)) {
+			PTR_ERR(slave);
+			goto free_parts;
+		}
+
+		mutex_lock(&mtd_partitions_mutex);
+		list_add_tail(&slave->node, &mtd->partitions);
+		mutex_unlock(&mtd_partitions_mutex);
+
+		ret = add_mtd_device(slave);
+		if (ret) {
+			printf("Failed to add MTD device!\n");
+			goto free_parts;
+		}
+
+		valid_parts++;
+	}
+
+	goto end;
+
+free_parts:
+	do_del_mtd_partitions(mtd);
+
+free_ptes:
+	free(ptes);
+end:
+	return ret;
+}
+
+static int add_mtd_partitions_fixed(struct mtd_info *master, ofnode parts)
+{
+	ofnode child;
 	int i = 0;
-
-	if (!master->dev && !ofnode_valid(master->flash_node))
-		return 0;
-
-	if (master->dev)
-		parts = ofnode_find_subnode(mtd_get_ofnode(master), "partitions");
-	else
-		parts = ofnode_find_subnode(master->flash_node, "partitions");
-
-	if (!ofnode_valid(parts) || !ofnode_is_enabled(parts) ||
-	    !ofnode_device_is_compatible(parts, "fixed-partitions"))
-		return 0;
 
 	ofnode_for_each_subnode(child, parts) {
 		struct mtd_partition part = { 0 };
@@ -946,6 +1122,35 @@ int add_mtd_partitions_of(struct mtd_info *master)
 	}
 
 	return 0;
+}
+
+#if CONFIG_IS_ENABLED(DM) && CONFIG_IS_ENABLED(OF_CONTROL)
+int add_mtd_partitions_of(struct mtd_info *master)
+{
+	ofnode parts;
+	int ret;
+
+	if (!master->dev && !ofnode_valid(master->flash_node))
+		return 0;
+
+	if (master->dev)
+		parts = ofnode_find_subnode(mtd_get_ofnode(master), "partitions");
+	else
+		parts = ofnode_find_subnode(master->flash_node, "partitions");
+
+	if (!ofnode_valid(parts) || !ofnode_is_enabled(parts))
+		return 0;
+
+	if (ofnode_device_is_compatible(parts, "fixed-partitions"))
+		ret = add_mtd_partitions_fixed(master, parts);
+	else if (ofnode_device_is_compatible(parts, "gpt")) {
+		ret = add_mtd_partitions_gpt(master);
+	} else {
+		debug("Invalid compatible for 'partitions' node!\n");
+		return -EINVAL;
+	}
+
+	return ret;
 }
 #endif /* CONFIG_IS_ENABLED(DM) && CONFIG_IS_ENABLED(OF_CONTROL) */
 
